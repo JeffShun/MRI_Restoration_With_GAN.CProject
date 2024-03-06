@@ -1,0 +1,3 @@
+- 1.在预测前需准备好模型的onnx文件，具体可参考关联项目MRI_Restoration_With_GAN;
+- 2.配置好显卡驱动、cuda、TensorRT和ITK;
+- 3.本项目主要基于ITK库读取dcm，然后由TensorRT加载onnx模型文件并构建engine对输入图像进行处理，最终输出去噪或者超分辨后的dcm.
