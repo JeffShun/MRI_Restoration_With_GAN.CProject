@@ -10,35 +10,13 @@
 
 
 // 构造函数初始化
-ImageProcessor::ImageProcessor(int mode) : mode(mode), engine(nullptr), logger() {
+ImageProcessor::ImageProcessor(string engine_model_path, string onnx_model_path) :
+	engine_model_path(engine_model_path),
+	onnx_model_path(onnx_model_path),
+	engine(nullptr),
+	logger() {
 	// Load the model
-	string engine_model_path;
-	string onnx_model_path;
-	switch (mode) {
-	case 0:
-		engine_model_path = "./engines/enhance.engine";
-		onnx_model_path = "./engines/enhance.onnx";
-		engine = buildEngine(engine_model_path, onnx_model_path, logger);
-		break;
-	case 1:
-		engine_model_path = "./engines/denoise_para2.engine";
-		onnx_model_path = "./engines/denoise_para2.onnx";
-		engine = buildEngine(engine_model_path, onnx_model_path, logger);
-		break;
-	case 2:
-		engine_model_path = "./engines/denoise_para4.engine";
-		onnx_model_path = "./engines/denoise_para4.onnx";
-		engine = buildEngine(engine_model_path, onnx_model_path, logger);
-		break;
-	case 3:
-		engine_model_path = "./engines/denoise_para10.engine";
-		onnx_model_path = "./engines/denoise_para10.onnx";
-		engine = buildEngine(engine_model_path, onnx_model_path, logger);
-		break;
-	default:
-		cout << "ImageProcessor mode is illegal!" << endl;
-		break;
-	}
+	engine = buildEngine(engine_model_path, onnx_model_path, logger);
 }
 
 ImageProcessor::~ImageProcessor() {
@@ -47,15 +25,14 @@ ImageProcessor::~ImageProcessor() {
 	}
 }
 
-ItkData ImageProcessor::readImage(string dcmPath) {
+void ImageProcessor::readImage(mData& dataStream) {
 	typedef itk::GDCMImageIO ImageIOType; 
 	typedef itk::ImageFileReader<ImageType2F> ReaderType; 
 
-	ImageIOType::Pointer dicomIO = ImageIOType::New(); // 创建 DICOM IO
-	ReaderType::Pointer reader = ReaderType::New(); // 创建图像文件读取器
+	ImageIOType::Pointer dicomIO = ImageIOType::New(); 
+	ReaderType::Pointer reader = ReaderType::New();
 
-	// 设置 DICOM 文件路径
-	reader->SetFileName(dcmPath);
+	reader->SetFileName(dataStream.inputPath);
 	reader->SetImageIO(dicomIO);
 
 	try {
@@ -71,60 +48,33 @@ ItkData ImageProcessor::readImage(string dcmPath) {
 	ImageType2F::RegionType region = img->GetLargestPossibleRegion();
 	ImageType2F::SizeType size = region.GetSize();
 
-	ItkData itkData;
-	itkData.dcmPath = dcmPath;
-	itkData.img = img;
-	itkData.size = size;
-	itkData.meta_dict = meta_dict;
-
-	return itkData;
+	dataStream.inImg = img;
+	dataStream.inSize = size;
+	dataStream.inMetaDict = meta_dict;
 }
 
-void ImageProcessor::printMetaData(const itk::MetaDataDictionary& meta_dict)
-{
-	typedef itk::MetaDataDictionary::ConstIterator MetaDataIterator;
-	MetaDataIterator metaIt = meta_dict.Begin();
-	MetaDataIterator metaEnd = meta_dict.End();
-
-	while (metaIt != metaEnd)
-	{
-		string key = metaIt->first;
-		string value;
-		itk::ExposeMetaData<string>(meta_dict, key, value);
-		cout << "Key: " << key << ", Value: " << value << endl;
-		++metaIt;
-	}
-}
 
 // 图像预处理函数实现
-ItkData ImageProcessor::preprocessImage(ItkData inputData) {
+void ImageProcessor::preprocessImage(mData& dataStream) {
 	cout << "Preprocessing the image..." << endl;
 
 	// 图像归一化
 	typedef itk::RescaleIntensityImageFilter<ImageType2F, ImageType2F> RescalerType;
 	RescalerType::Pointer rescaler = RescalerType::New();
-	ImageType2F::Pointer inputImg = inputData.img;
-	ImageType2F::SizeType inputSize = inputData.size;
 
-	rescaler->SetInput(inputImg);
+	rescaler->SetInput(dataStream.inImg);
 	rescaler->SetOutputMinimum(0.0);
 	rescaler->SetOutputMaximum(1.0);
 	rescaler->Update();
 
 	// 图像resize，因为神经网络包含5次下采样，图像大小必须是32的整数倍
-	ImageType2F::SizeType outSize;
-	float upsample_scale = (mode == 0) ? 2.0 : 1.0;
+	float upsample_scale = dataStream.sr_ratio * 2 + 1;
+	dataStream.outSize[0] = static_cast<unsigned int>(ceil(dataStream.inSize[0] * upsample_scale / 32.0)) * 32 ;
+	dataStream.outSize[1] = static_cast<unsigned int>(ceil(dataStream.inSize[1] * upsample_scale / 32.0)) * 32 ;
 
-	outSize[0] = static_cast<unsigned int>(ceil(inputSize[0] / 32.0)) * 32 * upsample_scale;
-	outSize[1] = static_cast<unsigned int>(ceil(inputSize[1] / 32.0)) * 32 * upsample_scale;
-
-	ImageType2F::Pointer outputImg;
-	resizeImg(rescaler->GetOutput(), outputImg, outSize);
-	ItkData outputData(inputData);
-	outputData.img = outputImg;
-	outputData.size = outSize;
-
-	return outputData;
+	ImageType2F::Pointer Img;
+	resizeImg(rescaler->GetOutput(), Img, dataStream.outSize);
+	dataStream.outImg = Img;
 }
 
 
@@ -160,10 +110,7 @@ void ImageProcessor::resizeImg(ImageType2F::Pointer oriImg, ImageType2F::Pointer
 
 
 // engine加载
-ICudaEngine* ImageProcessor::buildEngine(
-	string engine_model_path,
-	string onnx_model_path,
-	ILogger& logger) 
+ICudaEngine* ImageProcessor::buildEngine(string engine_model_path, string onnx_model_path, ILogger& logger) 
 {
 	ICudaEngine *engine = nullptr;
 	// 判断是否存在序列化文件
@@ -194,9 +141,9 @@ ICudaEngine* ImageProcessor::buildEngine(
 		}
 
 		IOptimizationProfile* profile = builder->createOptimizationProfile();
-		profile->setDimensions("input", OptProfileSelector::kMIN, Dims4(1, 1, 64, 64));	
-		profile->setDimensions("input", OptProfileSelector::kOPT, Dims4(1, 1, 512, 512));	
-		profile->setDimensions("input", OptProfileSelector::kMAX, Dims4(1, 1, 1024, 1024));	
+		profile->setDimensions("input", OptProfileSelector::kMIN, Dims4(1, 4, 64, 64));	
+		profile->setDimensions("input", OptProfileSelector::kOPT, Dims4(1, 4, 512, 512));	
+		profile->setDimensions("input", OptProfileSelector::kMAX, Dims4(1, 4, 1024, 1024));	
 		config->addOptimizationProfile(profile);
 
 
@@ -244,32 +191,34 @@ ICudaEngine* ImageProcessor::buildEngine(
 }
 
 // engine预测
-void ImageProcessor::enginePredict(ICudaEngine *engine, ItkData& inputData)
+void ImageProcessor::enginePredict(mData& dataStream)
 {
-	ImageType2F::Pointer imageData = inputData.img;
-	float* imageData_buffer = imageData->GetBufferPointer();
-	void *buffers[2];
-	// 获取模型的输入维度并分配GPU内存
+	ImageType2F::Pointer inputImage = dataStream.outImg;
+	float* imageBuffer = inputImage->GetBufferPointer();
+
+	// 定义输入、输出尺寸
+	size_t insize = 4 * dataStream.outSize[0] * dataStream.outSize[1];
+	size_t osize = dataStream.outSize[0] * dataStream.outSize[1];
+
+	// 可变维度赋值
 	Dims inputDims = engine->getBindingDimensions(0);
-	inputDims.d[2] = inputData.size[0];
-	inputDims.d[3] = inputData.size[1];
-
-	int insize = 1;
-	for (int j = 0; j < inputDims.nbDims; ++j) {
-		insize *= inputDims.d[j];
-	}
-	cudaMalloc(&buffers[0], insize * sizeof(float));
-
-	// 获取模型输出尺寸并分配GPU内存
 	Dims outputDims = engine->getBindingDimensions(1);
-	outputDims.d[2] = inputData.size[0];
-	outputDims.d[3] = inputData.size[1];
+	inputDims.d[2] = dataStream.outSize[0];
+	inputDims.d[3] = dataStream.outSize[1];
+	outputDims.d[2] = dataStream.outSize[0];
+	outputDims.d[3] = dataStream.outSize[1];
+
+	// 将Image和SR Ratio、Deblur Ratio、Denoise Ratio拼接为engine输入
+	vector<float> engineBuffer(insize);
+	copy(imageBuffer, imageBuffer + osize, engineBuffer.begin());
+	fill_n(engineBuffer.begin() + osize * 1, osize, dataStream.sr_ratio);
+	fill_n(engineBuffer.begin() + osize * 2, osize, dataStream.deblur_ratio);
+	fill_n(engineBuffer.begin() + osize * 3, osize, dataStream.denoise_ratio);
+	float* engineBufferPtr = engineBuffer.data();
 	
-	int osize = 1;
-	for (int j = 0; j < outputDims.nbDims; ++j) {
-		osize *= outputDims.d[j];
-	}
-	cudaMalloc(&buffers[0], osize * sizeof(float));
+	// 分配输入、输出显存
+	void *buffers[2];
+	cudaMalloc(&buffers[0], insize * sizeof(float));
 	cudaMalloc(&buffers[1], osize * sizeof(float));
 
 	// 给模型输出数据分配相应的CPU内存
@@ -280,15 +229,16 @@ void ImageProcessor::enginePredict(ICudaEngine *engine, ItkData& inputData)
 	cudaStreamCreate(&stream);
 
 	// 拷贝输入数据
-	cudaMemcpyAsync(buffers[0], imageData_buffer, insize * sizeof(float), cudaMemcpyHostToDevice, stream);
+	cudaMemcpyAsync(buffers[0], engineBufferPtr, insize * sizeof(float), cudaMemcpyHostToDevice, stream);
 
-	// 执行推理
+	// 创建Context
 	IExecutionContext *context = engine->createExecutionContext();
 
-	// 设置输入维度
+	// 设置Context参数，执行推理
 	context->setBindingDimensions(0, inputDims);
 	context->setOptimizationProfileAsync(0, stream);
 	context->enqueueV2(buffers, stream, nullptr);
+
 	// 拷贝输出数据
 	cudaMemcpyAsync(output_buffer, buffers[1], osize * sizeof(float), cudaMemcpyDeviceToHost, stream);
 	cudaStreamSynchronize(stream);
@@ -298,7 +248,7 @@ void ImageProcessor::enginePredict(ICudaEngine *engine, ItkData& inputData)
 	cudaStreamDestroy(stream);
 	context->destroy();
 
-	// 输出数据截断到0-1之间，并传递给ItkImage
+	// 输出数据截断到0-1之间
 	for (int i = 0; i < osize; ++i) {
 		if (output_buffer[i] < 0.0f) {
 			output_buffer[i] = 0.0f;
@@ -307,27 +257,24 @@ void ImageProcessor::enginePredict(ICudaEngine *engine, ItkData& inputData)
 			output_buffer[i] = 1.0f;
 		}
 	}
-	memcpy(inputData.img->GetBufferPointer(), output_buffer, inputData.size[0]* inputData.size[1] * sizeof(float));
+	memcpy(dataStream.outImg->GetBufferPointer(), output_buffer, osize * sizeof(float));
 }
 
-void ImageProcessor::postProcess(ItkData& inputData, ImageType2F::SizeType oShape) {
+void ImageProcessor::postProcess(mData& dataStream) {
 
 	// 图像灰阶调整
 	typedef itk::RescaleIntensityImageFilter<ImageType2F, ImageType2F> RescalerType;
 	RescalerType::Pointer rescaler = RescalerType::New();
 
-	rescaler->SetInput(inputData.img);
+	rescaler->SetInput(dataStream.outImg);
 	rescaler->SetOutputMinimum(0.0);
 	rescaler->SetOutputMaximum(4095.0);
 	rescaler->Update();
-
-	// 图像缩放
-	resizeImg(rescaler->GetOutput(), inputData.img, oShape);
-	inputData.size = oShape;
+	dataStream.outImg = rescaler->GetOutput();
 }
 
-void ImageProcessor::saveAsDICOM(ItkData inputData) {
-	string dcmPath = inputData.dcmPath;
+void ImageProcessor::saveDICOM(mData& dataStream) {
+	string dcmPath = dataStream.inputPath;
 	size_t lastSlashPos = dcmPath.find_last_of('/');
 	if (lastSlashPos == string::npos) {
 		lastSlashPos = 0;
@@ -346,55 +293,71 @@ void ImageProcessor::saveAsDICOM(ItkData inputData) {
 	WriterType::Pointer writer_dcm = WriterType::New();
 	itk::GDCMImageIO::Pointer dcmIO = itk::GDCMImageIO::New();
 
-	// 设置输出路径
+	// 设置metaDict
+	dataStream.outMetaDict = dataStream.inMetaDict;
+	dcmIO->SetMetaDataDictionary(dataStream.outMetaDict);
+
 	writer_dcm->SetFileName(dcmPath_save);
-	dcmIO->SetMetaDataDictionary(inputData.meta_dict);
 	writer_dcm->SetImageIO(dcmIO);
-	writer_dcm->SetInput(inputData.img);
+	writer_dcm->SetInput(dataStream.outImg);
 	writer_dcm->SetUseInputMetaDataDictionary(0);
 	writer_dcm->Update();
 }
 
-void ImageProcessor::pushToStack(string dataPath) {
-	dataStack.push(dataPath);
+void ImageProcessor::pushToQueue(mData& dataStream) {
+	dataQueue.push(dataStream);
 }
 
-string ImageProcessor::popFromStack() {
-	string dataPath = dataStack.top();
-	dataStack.pop();
-	return dataPath;
+
+size_t ImageProcessor::queueLen() {
+	size_t length = dataQueue.size();
+	return length;
 }
+
 
 void ImageProcessor::processStart() {
 	cout << "Image processing pipeline initiated!..." << endl;
-	while (!dataStack.empty()) {
-		// 从栈中取出数据
-		string dataPath = popFromStack();
-		ItkData inputData = readImage(dataPath);
+	while (!dataQueue.empty()) {
+		// 从队列中取出数据
+		mData dataStream = dataQueue.front();
+		dataQueue.pop();
+		// 读取到数据流
+		readImage(dataStream);
 		// 图像预处理
-		ItkData processData = preprocessImage(inputData);
+		preprocessImage(dataStream);
 		// engine 预测
-		enginePredict(engine, processData);
-		float upsample_scale = (mode == 0) ? 2.0 : 1.0;
-		ImageType2F::SizeType Osize;
-		Osize[0] = inputData.size[0] * upsample_scale;
-		Osize[1] = inputData.size[1] * upsample_scale;
-		postProcess(processData, Osize);
-		saveAsDICOM(processData);
+		enginePredict(dataStream);
+		// 后处理
+		postProcess(dataStream);
+		// 保存输出为dcm
+		saveDICOM(dataStream);
 	}
 }
 
 
 int main() {
-	auto startTime = chrono::high_resolution_clock::now(); // 开始计时
-
+	
 	// 创建 ImageProcessor 对象
-	ImageProcessor processor(2);
-	string directory = "./test_data";
+	string engine_model_path = "./model/model.engine";
+	string onnx_model_path = "./model/model.onnx";
+	ImageProcessor processor(engine_model_path, onnx_model_path);
+
+	auto startTime = chrono::high_resolution_clock::now(); // 开始计时
+	// 初始化传入参数
+	string directory = "./test_mini";
+	float sr_ratio = 1.0;
+	float deblur_ratio = 0.7;
+	float denoise_ratio = 0.3;
+	// Push 到处理管道
 	for (const auto& entry : experimental::filesystem::directory_iterator(directory)) {
 		if (entry.path().extension() == ".dcm") {
-			processor.pushToStack(entry.path().string());
-		}
+			mData dataStream;
+			dataStream.inputPath = entry.path().string();
+			dataStream.sr_ratio = sr_ratio;
+			dataStream.deblur_ratio = deblur_ratio;
+			dataStream.denoise_ratio = denoise_ratio;
+			processor.pushToQueue(dataStream);
+		};
 	}
 	processor.processStart();
 

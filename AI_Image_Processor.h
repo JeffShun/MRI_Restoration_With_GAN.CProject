@@ -1,6 +1,6 @@
 
 #include <vector>
-#include <stack>
+#include <queue>
 #include <string>
 #include "itkImage.h"
 #include <iostream>
@@ -24,30 +24,48 @@ class Logger : public ILogger
 	}
 } gLogger;
 
-struct ItkData {
-	string dcmPath;
-	ImageType2F::Pointer img;
-	ImageType2F::SizeType size;
-	itk::MetaDataDictionary meta_dict;
+
+struct mData {
+	string inputPath;
+	float sr_ratio;
+	float deblur_ratio;
+	float denoise_ratio;
+	ImageType2F::Pointer inImg;
+	ImageType2F::SizeType inSize;
+	itk::MetaDataDictionary inMetaDict;
+	ImageType2F::Pointer outImg;
+	ImageType2F::SizeType outSize;
+	itk::MetaDataDictionary outMetaDict;
 };
+
 
 class ImageProcessor {
 public:
-	ImageProcessor(int mode);
+	ImageProcessor(string engine_model_path, string onnx_model_path);
 	~ImageProcessor();
-	void pushToStack(string dataPath);
-	string popFromStack();
+
+	mData dataStream;
+
+	void pushToQueue(mData& dataStream);
 	void processStart();
+	size_t queueLen();
+
+	float sr_ratio;
+	float deblur_ratio;
+	float denoise_ratio;
 
 private:
 	ICudaEngine* engine;
 	Logger logger;
-	stack<string> dataStack;
-	int mode;
+	queue<mData> dataQueue;
+	string engine_model_path;
+	string onnx_model_path;
 
-	ItkData readImage(string dcmPath);
-	ItkData preprocessImage(ItkData inputData);
-	void printMetaData(const itk::MetaDataDictionary& meta_dict);
+	void readImage(mData& dataStream);
+	void preprocessImage(mData& dataStream);
+	void enginePredict(mData& dataStream);
+	void postProcess(mData& dataStream);
+	void saveDICOM(mData& dataStream);
 
 	void resizeImg(
 		ImageType2F::Pointer oriImg,
@@ -58,8 +76,4 @@ private:
 		string engine_model_path,
 		string onnx_model_path,
 		ILogger& logger);
-
-	void enginePredict(ICudaEngine *engine, ItkData& inputData);
-	void postProcess(ItkData& inputData, ImageType2F::SizeType oShape);
-	void saveAsDICOM(ItkData inputData);
 };
